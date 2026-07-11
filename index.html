@@ -678,6 +678,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
         </div>
       </div>
       <div class="alert-i" id="ap-note" style="display:block;margin-bottom:12px"></div>
+      <div id="ap-progress" style="margin-bottom:12px"></div>
       <div id="ap-rows"></div>
       <div class="alert-r" id="ap-rejwarn" style="display:none"></div>
     </div>
@@ -686,8 +687,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
     <div class="outcome-card" id="card-outcome">
       <div class="card-title" style="color:#0a6644">Deal outcome &amp; closure</div>
       <div class="g4">
-        <div class="field"><label>Deal status</label>
-          <select id="f-dstatus" onchange="markDirty();onStatusChange(this.value)">
+        <div class="field"><label>Deal status <span style="font-weight:400;color:#bbb">(system-managed)</span></label>
+          <select id="f-dstatus" disabled title="Status is set automatically by the approval workflow and stage buttons above — it can't be edited directly.">
             <option value="draft">Draft</option>
             <option value="approval_pending">Approval Pending</option>
             <option value="partner_approved">Partner Approved</option>
@@ -868,7 +869,18 @@ function fbGet(id){
   return new Promise(function(resolve){
     var timer = setTimeout(function(){ if(!settled){ settled=true; resolve(local); } }, 2000);
     fbDb.ref('deals2/'+id).once('value')
-      .then(function(s){ if(!settled){ settled=true; clearTimeout(timer); resolve(s.val()||local); } })
+      .then(function(s){
+        if(!settled){
+          settled=true; clearTimeout(timer);
+          var v = s.val();
+          // Firebase is source of truth. A successful read that returns null means the
+          // record was deleted (or never existed) — do NOT fall back to a stale local
+          // copy in that case, or a deleted deal keeps reappearing. Only fall back to
+          // local when Firebase itself is unreachable (see .catch below / timeout above).
+          if(v===null||v===undefined){ lsDel(id); resolve(null); }
+          else { resolve(v); }
+        }
+      })
       .catch(function(){ if(!settled){ settled=true; clearTimeout(timer); resolve(local); } });
   });
 }
@@ -1154,7 +1166,13 @@ function apSubmit(decision){
     var existing = current.approvals[apData.pi] || {};
     if(existing.status && existing.status!=='pending') return undefined; // abort — already voted
     current.approvals[apData.pi] = myApprEntry;
-    current.status = computeOverallStatus(current.approvals, tierReq);
+    // Only let this vote drive the deal's overall status while it's still in the
+    // approval-decision phase — a late vote must not regress a deal that the requester
+    // has already moved past approval (quotation sent, negotiating, won, lost...).
+    var curSt = current.status||'draft';
+    if(curSt==='draft'||curSt==='approval_pending'||curSt==='partner_approved'){
+      current.status = computeOverallStatus(current.approvals, tierReq);
+    }
     current.updatedAt = approvalTs;
     return current;
   }).then(function(result){
@@ -1236,8 +1254,18 @@ function startRealtimeSync(){
       var arr = Object.values(lsAll()).sort(function(a,b){ return (b.createdAt||0)-(a.createdAt||0); });
       renderDashboard(arr);
     }
+    // If the deal currently open in the form was deleted elsewhere (e.g. directly in
+    // Firebase), don't let this tab keep displaying/editing a ghost record — lock it
+    // and send the user back to the dashboard so it can't be resurrected by a Save.
+    if(currentDeal && currentDeal.id && !fbData[currentDeal.id] && el('v-form') && el('v-form').style.display!=='none'){
+      currentDeal.__deletedRemotely = true;
+      isDirty = false;
+      showToast('⚠ This deal was deleted — returning to dashboard.','err',5000);
+      showView('dash');
+      return;
+    }
     // Auto-refresh the currently open deal form if its record changed
-    if(currentDeal && currentDeal.id && fbData[currentDeal.id] && el('v-form') && el('v-form').style.display!=='none'){
+    if(currentDeal && currentDeal.id && fbData[currentDeal.id] && !currentDeal.__deletedRemotely && el('v-form') && el('v-form').style.display!=='none'){
       var updated = fbData[currentDeal.id];
       if(updated.approvals){
         var tierReqRt = tier(+(currentDeal.vq)||0).req;
@@ -1253,7 +1281,11 @@ function startRealtimeSync(){
           currentDeal.aps[pi].note = ap.note||'';
         });
         var computedSt = computeOverallStatus(currentDeal.approvals, tierReqRt);
-        if(computedSt !== currentDeal.status){
+        // Only let the computed approval status drive the deal status while the deal is
+        // still in the approval-decision phase — once it has moved on (quotation sent,
+        // negotiating, won, lost...) a late/changed vote must not regress it backward.
+        var stillDeciding = (currentDeal.status==='approval_pending'||currentDeal.status==='partner_approved');
+        if(stillDeciding && computedSt !== currentDeal.status){
           currentDeal.status = computedSt;
           setVal('f-dstatus', computedSt);
           renderWfStepper();
@@ -1464,7 +1496,9 @@ function getFormData(){
   d.flags={newc:el('fc-new').checked,unclear:el('fc-unclear').checked,
     urgent:el('fc-urgent').checked,meetings:el('fc-meetings').checked,
     sourced:el('fc-sourced').checked,advance:el('fc-advance').checked,strategic:el('fc-strategic').checked};
-  d.status  = el('f-dstatus').value||d.status||'draft';
+  // Status is system-managed (driven by submitForApproval / partner approvals / workflow
+  // buttons only) — never read from the dropdown, so it can't be hand-picked to skip approval.
+  d.status  = (currentDeal && currentDeal.status) || d.status || 'draft';
   d.closed  = el('f-closed').value; d.cdate=el('f-cdate').value;
   d.edate   = el('f-edate').value;  d.cnotes=el('f-cnotes').value;
   d.svcs    = currentDeal ? (currentDeal.svcs||[]) : [];
@@ -1477,6 +1511,10 @@ function getFormData(){
 // SAVE DEAL
 // ═══════════════════════════════════════════════
 function saveDeal(){
+  if(currentDeal && currentDeal.__deletedRemotely){
+    showToast('⚠ This deal was deleted elsewhere and can\'t be saved.','err');
+    return;
+  }
   var d = getFormData();
   d.updatedAt = Date.now();
   if(!d.createdAt) d.createdAt = Date.now();
@@ -2063,6 +2101,21 @@ function updateOverallAp(){
   } else {
     pill.className='apill ap-pend'; pill.textContent='Pending'; rw.style.display='none';
   }
+
+  // ── Explicit progress: N of M required partners approved, plus who's still pending ──
+  var pg = el('ap-progress');
+  if(pg){
+    var approvedCount = t.req.filter(function(i){return(d.aps&&d.aps[i]||{}).s==='approved';}).length;
+    var pendingNames  = t.req.filter(function(i){var s=(d.aps&&d.aps[i]||{}).s; return s!=='approved'&&s!=='rejected';}).map(function(i){return ps[i].name;});
+    var pct = t.req.length ? Math.round(100*approvedCount/t.req.length) : 0;
+    var barColor = anyRej ? '#c0392b' : '#D4A017';
+    pg.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#888;margin-bottom:4px">'
+      +'<span>Approval progress</span><span style="font-weight:700;color:#1a1a1a">'+approvedCount+' of '+t.req.length+' required partners approved</span></div>'
+      +'<div style="height:7px;background:#f0eeea;border-radius:99px;overflow:hidden">'
+      +'<div style="height:100%;width:'+pct+'%;background:'+barColor+';border-radius:99px;transition:width .3s"></div></div>'
+      +(pendingNames.length&&!anyRej?'<div style="font-size:11px;color:#aaa;margin-top:5px">Awaiting: '+esc(pendingNames.join(', '))+'</div>':'');
+  }
 }
 
 function refreshApStatus(btn){
@@ -2119,11 +2172,14 @@ function refreshApStatus(btn){
     }catch(e){}
 
     // ── Compute and apply new overall status ──
+    // Only while the deal is still in the approval-decision phase — never regress a deal
+    // that has already moved on to quotation_sent/negotiating/won/lost.
     var tierReq = t2.req;
-    if(currentDeal.approvals){
+    var stillDeciding = (currentDeal.status==='approval_pending'||currentDeal.status==='partner_approved'||currentDeal.status==='draft');
+    if(stillDeciding && currentDeal.approvals){
       var newSt = computeOverallStatus(currentDeal.approvals, tierReq);
       if(newSt !== currentDeal.status){ currentDeal.status=newSt; setVal('f-dstatus',newSt); changed=true; }
-    } else if(data.status && data.status!==currentDeal.status){
+    } else if(stillDeciding && data.status && data.status!==currentDeal.status){
       currentDeal.status=data.status; setVal('f-dstatus',data.status); changed=true;
     }
 
