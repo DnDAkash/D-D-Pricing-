@@ -2338,7 +2338,7 @@ function showConfirm(title,msg,cb,okLabel,okCls){
   el('confirm-overlay').classList.add('open');
 }
 function closeConfirm(){ el('confirm-overlay').classList.remove('open'); confirmCb=null; }
-function runConfirm(){ closeConfirm(); if(confirmCb) confirmCb(); }
+function runConfirm(){ var cb=confirmCb; closeConfirm(); if(cb) cb(); }
 
 // ═══════════════════════════════════════════════
 // FIREBASE INIT & BOOT
